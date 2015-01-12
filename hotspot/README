@@ -1,0 +1,97 @@
+This directory contains extensions of the OpenJDK HotSpot virtual machine which
+optimize and intrinsify specific features of the generic ObjectLayout library.
+
+INSTALLATION
+============
+
+The implementation is organized as a Mercurial patch queue [1] against a recent
+version of OpenJDK 9 [2]. Using it is as simple as:
+
+hg clone http://hg.openjdk.java.net/jdk9/dev jdk9-dev
+cd jdk9-dev
+bash get_source.sh
+ln -s <ObjectLayout>/hotspot/mq/patches hotspot/.hg/
+hg -R hotspot qpush --all
+mkdir build && cd build
+bash ../configure
+make images
+
+This will build a fresh OpenJDK 9 image which contains the ObjectLayout
+extensions from this directory. The ObjectLayout optimizations are disabled by
+default.
+
+
+USAGE
+=====
+
+The ObjectLayout optimizations can be switched on with -XX:+OptimizeObjectLayout
+
+See the examples/ directory for some typical use cases. The various source
+files contain detailed descriptions on how to run them and on the performed
+optimizations.
+
+
+STATUS
+======
+ - supports x86_64 (only tested on Linux)
+ - support for org.ObjectLayout.Intrinsic annotation
+ - intrinsification of AbstractIntrinsicObjectModel.constructElementWithin()
+
+
+DESCRIPTION
+===========
+
+Currently, the whole implementation consist of four patches:
+
+ObjectLayout_layout_intrinisic_fields.patch
+-------------------------------------------
+ - patches the object layout mechanism to account for @Intrinsic fields
+
+ObjectLayout_intrinsify_constructElementWithin.patch
+----------------------------------------------------
+ - intrinsifies calls to org.ObjectLayout.AbstractIntrinsicObjectModel.constructElementWithin()
+ - this is currently done via an adjusted native wrapper which call a native
+   JVM_Entry
+ - could be optimized in the future (i.e. handled directly in the interpreter, by
+   providing a special graph kit version for C2)
+ 
+ObjectLayout_putfield_getfield.patch
+------------------------------------
+ - patches the putfield/getfield templates in the interpreter to handle
+   intrinsified fields.
+
+ObjectLayout_C2_putfield_getfield.patch
+---------------------------------------
+ - correctly handle putfield/getfield of intrinsified fields in C2 compiled code
+ - optimized access to intrinsified fields by eliminating redundant loads. Use
+   dead-reckoning instead (see examples/IntrinsicFieldDeadReckonTest.java for a
+   more detailed description and example).
+
+
+LIMITATIONS
+===========
+
+Be aware, this is work in progress. The implementation is still very basic. It
+is intended to demonstrate various implementation details and as a basis for
+further discussions. It is by no means suited for any productive use!
+
+Known limitations and problems:
+
+1. Currently there's no real garbage collection support. When a GC is triggered
+   and there exist life references to both, an intrinsified object as well as to
+   its enclosing object, something bad will happen (see
+   examples/IntrinsicFieldGCTest.java for an example).
+
+2. There's no client compiler (i.e. C1) support. Run with -XX:-TieredCompilation
+
+3. If you get wrong results with -XX:+OptimizeObjectLayout you may try to switch
+   off loop unrolling in C2 -XX:LoopUnrollLimit=0
+
+4. If you get errors during JIT-compilation you can try to switch off escape
+   analysis with -XX:-DoEscapeAnalysis
+
+Please report problems and/or enhancements to volker.simonis@gmail.com
+
+
+[1] http://mercurial.selenic.com/wiki/MqExtension
+[2] http://hg.openjdk.java.net/jdk9/dev/hotspot/

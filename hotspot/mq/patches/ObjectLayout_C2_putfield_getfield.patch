@@ -1,0 +1,237 @@
+# HG changeset patch
+# Parent e4536f11220ccd263e7eda968421f6ffbf85b673
+ObjectLayout: C2 changes to putfield/getfield templates to handle intrinsified objects
+
+diff -r e4536f11220c src/cpu/x86/vm/templateInterpreter_x86_64.cpp
+--- a/src/cpu/x86/vm/templateInterpreter_x86_64.cpp	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/cpu/x86/vm/templateInterpreter_x86_64.cpp	Mon Jan 12 19:46:36 2015 +0100
+@@ -1700,6 +1700,7 @@
+     case Interpreter::java_lang_math_sqrt    : // fall thru
+     case Interpreter::java_lang_math_pow     : // fall thru
+     case Interpreter::java_lang_math_exp     :
++    case Interpreter::org_ObjectLayout_AbstractIntrinsicObjectModel_constructElementWithin: // until we intrinsify it in the compiler
+       return false;
+     default:
+       return true;
+diff -r e4536f11220c src/cpu/x86/vm/x86_64.ad
+--- a/src/cpu/x86/vm/x86_64.ad	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/cpu/x86/vm/x86_64.ad	Mon Jan 12 19:46:36 2015 +0100
+@@ -6995,6 +6995,17 @@
+   ins_pipe(empty);
+ %}
+ 
++instruct castIntrinsic(rRegP dst, immL32 src, rFlagsReg cr)
++%{
++  match(Set dst (CastIntrinsic (AddP dst src)));
++  effect(KILL cr);
++
++  format %{ "addq    $dst, $src\t# intrinisc getfield" %}
++  opcode(0x81, 0x00); /* /0 id */
++  ins_encode(OpcSErm_wide(dst, src), Con8or32(src));
++  ins_pipe( ialu_reg );
++%}
++
+ instruct castII(rRegI dst)
+ %{
+   match(Set dst (CastII dst));
+diff -r e4536f11220c src/share/vm/adlc/formssel.cpp
+--- a/src/share/vm/adlc/formssel.cpp	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/share/vm/adlc/formssel.cpp	Mon Jan 12 19:46:36 2015 +0100
+@@ -772,6 +772,7 @@
+   if( _matrule && _matrule->_rChild &&
+        (!strcmp(_matrule->_rChild->_opType,"CastPP")       ||  // new result type
+         !strcmp(_matrule->_rChild->_opType,"CastX2P")      ||  // new result type
++        !strcmp(_matrule->_rChild->_opType,"CastIntrinsic")||  // org.ObjectLayout.Intrinsic
+         !strcmp(_matrule->_rChild->_opType,"DecodeN")      ||
+         !strcmp(_matrule->_rChild->_opType,"EncodeP")      ||
+         !strcmp(_matrule->_rChild->_opType,"DecodeNKlass") ||
+diff -r e4536f11220c src/share/vm/ci/ciField.hpp
+--- a/src/share/vm/ci/ciField.hpp	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/share/vm/ci/ciField.hpp	Mon Jan 12 19:46:36 2015 +0100
+@@ -173,6 +173,8 @@
+   bool is_stable      () { return flags().is_stable(); }
+   bool is_volatile    () { return flags().is_volatile(); }
+   bool is_transient   () { return flags().is_transient(); }
++  // org.ObjectLayout.Intrinsic fields
++  bool is_intrinsic   () { return flags().is_intrinsic(); }
+ 
+   bool is_call_site_target() {
+     ciInstanceKlass* callsite_klass = CURRENT_ENV->CallSite_klass();
+diff -r e4536f11220c src/share/vm/ci/ciFlags.hpp
+--- a/src/share/vm/ci/ciFlags.hpp	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/share/vm/ci/ciFlags.hpp	Mon Jan 12 19:46:36 2015 +0100
+@@ -60,6 +60,7 @@
+   bool is_abstract    () const         { return (_flags & JVM_ACC_ABSTRACT    ) != 0; }
+   bool is_strict      () const         { return (_flags & JVM_ACC_STRICT      ) != 0; }
+   bool is_stable      () const         { return (_flags & JVM_ACC_FIELD_STABLE) != 0; }
++  bool is_intrinsic   () const         { return (_flags & JVM_ACC_FIELD_INTRINSIC) != 0; }
+ 
+   // Conversion
+   jint   as_int()                      { return _flags; }
+diff -r e4536f11220c src/share/vm/opto/addnode.cpp
+--- a/src/share/vm/opto/addnode.cpp	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/share/vm/opto/addnode.cpp	Mon Jan 12 19:46:36 2015 +0100
+@@ -572,8 +572,9 @@
+ 
+   // If the left input is an add of a constant, flatten the expression tree.
+   const Node *n = in(Address);
+-  if (n->is_AddP() && n->in(Base) == in(Base)) {
+-    const AddPNode *addp = n->as_AddP(); // Left input is an AddP
++  const Node *intr = n->isa_CastIntrinsic();
++  if (n->is_AddP() && n->in(Base) == in(Base) || intr && intr->in(Base)->is_AddP()) {
++    const AddPNode *addp = intr ? intr->in(Base)->as_AddP() : n->as_AddP(); // Left input is an AddP
+     assert( !addp->in(Address)->is_AddP() ||
+              addp->in(Address)->as_AddP() != addp,
+             "dead loop in AddPNode::Ideal" );
+@@ -601,9 +602,11 @@
+       if( igvn ) {
+         set_req_X(Address,address,igvn);
+         set_req_X(Offset,offset,igvn);
++        if (intr) set_req_X(Base, addp->in(Base),igvn);
+       } else {
+         set_req(Address,address);
+         set_req(Offset,offset);
++        if (intr) set_req(Base,addp->in(Base));
+       }
+       return this;
+     }
+diff -r e4536f11220c src/share/vm/opto/castnode.cpp
+--- a/src/share/vm/opto/castnode.cpp	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/share/vm/opto/castnode.cpp	Mon Jan 12 19:46:36 2015 +0100
+@@ -192,6 +192,19 @@
+   return ConstraintCastNode::Ideal_DU_postCCP(ccp);
+ }
+ 
++//=============================================================================
++
++//------------------------------Ideal------------------------------------------
++Node *CastIntrinsicNode::Ideal(PhaseGVN *phase, bool can_reshape){
++  return NULL;
++}
++
++//------------------------------Ideal_DU_postCCP-------------------------------
++// Always keep cast after constant propagation
++Node *CastIntrinsicNode::Ideal_DU_postCCP( PhaseCCP *ccp ) {
++  return this;
++}
++
+ 
+ 
+ //=============================================================================
+diff -r e4536f11220c src/share/vm/opto/castnode.hpp
+--- a/src/share/vm/opto/castnode.hpp	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/share/vm/opto/castnode.hpp	Mon Jan 12 19:46:36 2015 +0100
+@@ -79,6 +79,17 @@
+   virtual Node *Ideal_DU_postCCP( PhaseCCP * );
+ };
+ 
++//------------------------------CastIntriniscNode-------------------------------------
++// cast pointer of an ecnclosing class to pointer of an intrinsified field (different type)
++class CastIntrinsicNode: public CastPPNode {
++  public:
++  CastIntrinsicNode (Node *n, const Type *t ): CastPPNode(n, t) { init_class_id(Class_CastIntrinsic); }
++  virtual const Type *Value( PhaseTransform *phase ) const { return _type; }
++  virtual Node *Ideal(PhaseGVN *phase, bool can_reshape);
++  virtual int Opcode() const;
++  virtual Node *Ideal_DU_postCCP( PhaseCCP * );
++};
++
+ //------------------------------CheckCastPPNode--------------------------------
+ // for _checkcast, cast pointer to pointer (different type), without JOIN,
+ class CheckCastPPNode: public TypeNode {
+diff -r e4536f11220c src/share/vm/opto/classes.hpp
+--- a/src/share/vm/opto/classes.hpp	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/share/vm/opto/classes.hpp	Mon Jan 12 19:46:36 2015 +0100
+@@ -54,6 +54,7 @@
+ macro(CallLeafNoFP)
+ macro(CallRuntime)
+ macro(CallStaticJava)
++macro(CastIntrinsic)
+ macro(CastII)
+ macro(CastX2P)
+ macro(CastP2X)
+diff -r e4536f11220c src/share/vm/opto/memnode.cpp
+--- a/src/share/vm/opto/memnode.cpp	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/share/vm/opto/memnode.cpp	Mon Jan 12 19:46:36 2015 +0100
+@@ -759,6 +759,7 @@
+         return n;
+ 
+       case Op_CastPP:
++      case Op_CastIntrinsic:
+         // If the CastPP is useless, just peek on through it.
+         if( ccp->type(adr) == ccp->type(adr->in(1)) ) {
+           // Remember the cast that we've peeked though. If we peek
+diff -r e4536f11220c src/share/vm/opto/node.hpp
+--- a/src/share/vm/opto/node.hpp	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/share/vm/opto/node.hpp	Mon Jan 12 19:46:36 2015 +0100
+@@ -51,6 +51,8 @@
+ class CallNode;
+ class CallRuntimeNode;
+ class CallStaticJavaNode;
++class CastPPNode;
++class CastIntrinsicNode;
+ class CatchNode;
+ class CatchProjNode;
+ class CheckCastPPNode;
+@@ -596,6 +598,8 @@
+     DEFINE_CLASS_ID(Type,  Node, 2)
+       DEFINE_CLASS_ID(Phi,   Type, 0)
+       DEFINE_CLASS_ID(ConstraintCast, Type, 1)
++        DEFINE_CLASS_ID(CastPP, ConstraintCast, 0)
++          DEFINE_CLASS_ID(CastIntrinsic, CastPP, 0)
+       DEFINE_CLASS_ID(CheckCastPP, Type, 2)
+       DEFINE_CLASS_ID(CMove, Type, 3)
+       DEFINE_CLASS_ID(SafePointScalarObject, Type, 4)
+@@ -718,6 +722,7 @@
+   DEFINE_CLASS_QUERY(CallLeaf)
+   DEFINE_CLASS_QUERY(CallRuntime)
+   DEFINE_CLASS_QUERY(CallStaticJava)
++  DEFINE_CLASS_QUERY(CastIntrinsic)
+   DEFINE_CLASS_QUERY(Catch)
+   DEFINE_CLASS_QUERY(CatchProj)
+   DEFINE_CLASS_QUERY(CheckCastPP)
+diff -r e4536f11220c src/share/vm/opto/parse3.cpp
+--- a/src/share/vm/opto/parse3.cpp	Sun Jan 11 23:58:45 2015 +0100
++++ b/src/share/vm/opto/parse3.cpp	Mon Jan 12 19:46:36 2015 +0100
+@@ -109,6 +109,20 @@
+     return;
+   }
+ 
++  // Intrinsic fields as constructed "in place" in their containing object so
++  // we can not do a 'putfield' on them (see JVM_ObjectLayoutConstructWithin).
++  if (OptimizeObjectLayout && field->is_intrinsic() && !is_get) {
++    (void) pop(); // just pop the value..
++    (void) pop(); // ..and the receiver
++    if (Verbose) {
++      tty->print("do_field_access() - ");
++      tty->print("found putfield for intrinsic field %s at bci: %d in ", field->name()->as_quoted_ascii(), bci());
++      method()->print_name();
++      tty->cr();
++    }
++    return;
++  }
++
+   assert(field->will_link(method()->holder(), bc()), "getfield: typeflow responsibility");
+ 
+   // Note:  We do not check for an unloaded field type here any more.
+@@ -206,6 +220,20 @@
+   Node *adr = basic_plus_adr(obj, obj, offset);
+   BasicType bt = field->layout_type();
+ 
++  if (OptimizeObjectLayout && field->is_intrinsic()) {
++    if (Verbose) {
++      tty->print("do_field_access() - ");
++      tty->print("found getfield for intrinsic field %s at bci: %d in ", field->name()->as_quoted_ascii(), bci());
++      method()->print_name();
++      tty->cr();
++    }
++    const Type *type = TypeOopPtr::make_from_klass_unique(field_klass->as_klass())->cast_to_ptr_type(TypePtr::NotNull);
++    Node *cast = new CastIntrinsicNode(adr, type);
++    cast = _gvn.transform(cast);
++    push(cast);
++    return;
++  }
++
+   // Build the resultant type of the load
+   const Type *type;
+ 

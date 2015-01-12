@@ -1,1 +1,9 @@
-ObjectLayout is aimed at creating some useful core Java classes that are designed with optimizable memory layout in mind
+ObjectLayout is aimed at creating some useful core Java classes that
+are designed with optimizable memory layout in mind.
+
+The ObjectLayout*/ directories contain the generic, pure Java
+ObjectLayout libraries which should run with any Java VM >= 6.
+
+The hotspot/ directory contains some OpenJDK specific VM optimizations
+with the goal to intrinsify and optimize the generic ObjectLayout
+library. See hotspot/README for more information.

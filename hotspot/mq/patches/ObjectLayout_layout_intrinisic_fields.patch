@@ -1,0 +1,310 @@
+# HG changeset patch
+# Parent 5dc8184af1e2bb30b0103113d1f1a58a21a80c37
+ObjectLayout: layout intrinsic fields
+
+diff -r 5dc8184af1e2 src/share/vm/classfile/classFileParser.cpp
+--- a/src/share/vm/classfile/classFileParser.cpp	Thu Jan 01 16:11:49 2015 -0800
++++ b/src/share/vm/classfile/classFileParser.cpp	Sun Jan 11 23:58:23 2015 +0100
+@@ -1799,6 +1799,10 @@
+     if (_location != _in_field && _location != _in_class)          break;  // only allow for fields and classes
+     if (!EnableContended || (RestrictContended && !privileged))    break;  // honor privileges
+     return _sun_misc_Contended;
++  case vmSymbols::VM_SYMBOL_ENUM_NAME(org_ObjectLayout_Intrinsic_signature):
++    if (_location != _in_field)   break;  // only allow for fields
++    if (!OptimizeObjectLayout)    break;
++    return _org_ObjectLayout_Intrinsic;
+   default: break;
+   }
+   return AnnotationCollector::_unknown;
+@@ -1809,6 +1813,8 @@
+     f->set_contended_group(contended_group());
+   if (is_stable())
+     f->set_stable(true);
++  if (is_intrinsic())
++    f->set_intrinsic(true);
+ }
+ 
+ ClassFileParser::FieldAnnotationCollector::~FieldAnnotationCollector() {
+@@ -3226,7 +3232,9 @@
+ };
+ 
+ // Layout fields and fill in FieldLayoutInfo.  Could use more refactoring!
+-void ClassFileParser::layout_fields(Handle class_loader,
++void ClassFileParser::layout_fields(Symbol* class_name,
++                                    Handle class_loader,
++                                    Handle protection_domain,
+                                     FieldAllocationCount* fac,
+                                     ClassAnnotationCollector* parsed_annotations,
+                                     FieldLayoutInfo* info,
+@@ -3264,6 +3272,19 @@
+     }
+   }
+ 
++  // Count the @Intrinsic fields.
++  //
++  // We ignore static fields, because @Intrinsic is not supported for them.
++  // The layout code below will also ignore the static fields.
++  int intrinsic_count = 0;
++  FieldAllocationCount fac_intrinsic;
++  for (AllFieldStream fs(_fields, _cp); !fs.done(); fs.next()) {
++    FieldAllocationType atype = (FieldAllocationType) fs.allocation_type();
++    if (fs.is_intrinsic() && !fs.access_flags().is_static()) {
++      fac_intrinsic.count[atype]++;
++      intrinsic_count++;
++    }
++  }
+ 
+   // Calculate the starting byte offsets
+   next_static_oop_offset      = InstanceMirrorKlass::offset_of_static_fields();
+@@ -3298,11 +3319,13 @@
+   // The packing code below relies on these counts to determine if some field
+   // can be squeezed into the alignment gap. Contended fields are obviously
+   // exempt from that.
++  // We also exclude @Intrinsic oop fields because they will be placed at the end of the object.
+   unsigned int nonstatic_double_count = fac->count[NONSTATIC_DOUBLE] - fac_contended.count[NONSTATIC_DOUBLE];
+   unsigned int nonstatic_word_count   = fac->count[NONSTATIC_WORD]   - fac_contended.count[NONSTATIC_WORD];
+   unsigned int nonstatic_short_count  = fac->count[NONSTATIC_SHORT]  - fac_contended.count[NONSTATIC_SHORT];
+   unsigned int nonstatic_byte_count   = fac->count[NONSTATIC_BYTE]   - fac_contended.count[NONSTATIC_BYTE];
+-  unsigned int nonstatic_oop_count    = fac->count[NONSTATIC_OOP]    - fac_contended.count[NONSTATIC_OOP];
++  unsigned int nonstatic_oop_count    = fac->count[NONSTATIC_OOP]    - fac_contended.count[NONSTATIC_OOP]
++                                                                     - fac_intrinsic.count[NONSTATIC_OOP];
+ 
+   // Total non-static fields count, including every contended field
+   unsigned int nonstatic_fields_count = fac->count[NONSTATIC_DOUBLE] + fac->count[NONSTATIC_WORD] +
+@@ -3478,6 +3501,9 @@
+     // contended instance fields are handled below
+     if (fs.is_contended() && !fs.access_flags().is_static()) continue;
+ 
++    // @Intrinsic instance fields are handled below
++    if (fs.is_intrinsic()) continue;
++
+     int real_offset;
+     FieldAllocationType atype = (FieldAllocationType) fs.allocation_type();
+ 
+@@ -3726,6 +3752,43 @@
+          is_contended_class ||
+          (nonstatic_fields_count > 0), "double-check nonstatic start/end");
+ 
++  int intrinsic_fields_start = align_size_up(nonstatic_fields_end, wordSize);
++  int intrinsic_fields_end   = intrinsic_fields_start;
++
++  // Handle the @Intrinsic fields.
++  if (intrinsic_count > 0) {
++
++    for (AllFieldStream fs(_fields, _cp); !fs.done(); fs.next()) {
++
++      // skip already laid out fields
++      if (!fs.is_intrinsic()) continue;
++
++      int real_offset;
++      FieldAllocationType atype = (FieldAllocationType) fs.allocation_type();
++
++      switch (atype) {
++        case NONSTATIC_OOP: {
++          Klass* k = SystemDictionary::resolve_super_or_fail(class_name,
++                                                             fs.signature(),
++                                                             class_loader,
++                                                             protection_domain,
++                                                             true,
++                                                             CHECK);
++          fs.set_offset(intrinsic_fields_end);
++          intrinsic_fields_end += align_size_up(k->layout_helper(), wordSize); // sizeof(@Intrinsic field type)
++          break;
++        }
++
++        default:
++          // @Intrinsic only makes sense on non-static object fields
++          ShouldNotReachHere();
++      }
++    }
++
++    instance_end = intrinsic_fields_end;
++    instance_size += (intrinsic_fields_end - intrinsic_fields_start) / wordSize;
++  }
++
+   // Number of non-static oop map blocks allocated at end of klass.
+   const unsigned int total_oop_map_count =
+     compute_oop_map_count(_super_klass, nonstatic_oop_map_count,
+@@ -3739,6 +3802,8 @@
+           instance_size,
+           nonstatic_fields_start,
+           nonstatic_fields_end,
++          intrinsic_fields_start,
++          intrinsic_fields_end,
+           static_fields_end);
+   }
+ 
+@@ -4099,7 +4164,7 @@
+     itable_size = access_flags.is_interface() ? 0 : klassItable::compute_itable_size(_transitive_interfaces);
+ 
+     FieldLayoutInfo info;
+-    layout_fields(class_loader, &fac, &parsed_annotations, &info, CHECK_NULL);
++    layout_fields(class_name, class_loader, protection_domain, &fac, &parsed_annotations, &info, CHECK_NULL);
+ 
+     int total_oop_map_size2 =
+           InstanceKlass::nonstatic_oop_map_size(info.total_oop_map_count);
+@@ -4364,11 +4429,13 @@
+                                          int instance_size,
+                                          int instance_fields_start,
+                                          int instance_fields_end,
++                                         int intrinsic_fields_start,
++                                         int intrinsic_fields_end,
+                                          int static_fields_end) {
+   tty->print("%s: field layout\n", name->as_klass_external_name());
+   tty->print("  @%3d %s\n", instance_fields_start, "--- instance fields start ---");
+   for (AllFieldStream fs(fields, cp); !fs.done(); fs.next()) {
+-    if (!fs.access_flags().is_static()) {
++    if (!fs.access_flags().is_static() && !fs.is_intrinsic()) {
+       tty->print("  @%3d \"%s\" %s\n",
+           fs.offset(),
+           fs.name()->as_klass_external_name(),
+@@ -4376,6 +4443,16 @@
+     }
+   }
+   tty->print("  @%3d %s\n", instance_fields_end, "--- instance fields end ---");
++  tty->print("  @%3d %s\n", intrinsic_fields_start, "--- intrinsic fields start ---");
++  for (AllFieldStream fs(fields, cp); !fs.done(); fs.next()) {
++    if (fs.is_intrinsic()) {
++      tty->print("  @%3d \"%s\" %s\n",
++          fs.offset(),
++          fs.name()->as_klass_external_name(),
++          fs.signature()->as_klass_external_name());
++    }
++  }
++  tty->print("  @%3d %s\n", intrinsic_fields_end, "--- intrinsic fields end ---");
+   tty->print("  @%3d %s\n", instance_size * wordSize, "--- instance ends ---");
+   tty->print("  @%3d %s\n", InstanceMirrorKlass::offset_of_static_fields(), "--- static fields start ---");
+   for (AllFieldStream fs(fields, cp); !fs.done(); fs.next()) {
+diff -r 5dc8184af1e2 src/share/vm/classfile/classFileParser.hpp
+--- a/src/share/vm/classfile/classFileParser.hpp	Thu Jan 01 16:11:49 2015 -0800
++++ b/src/share/vm/classfile/classFileParser.hpp	Sun Jan 11 23:58:23 2015 +0100
+@@ -130,6 +130,7 @@
+       _method_LambdaForm_Hidden,
+       _sun_misc_Contended,
+       _field_Stable,
++      _org_ObjectLayout_Intrinsic,
+       _annotation_LIMIT
+     };
+     const Location _location;
+@@ -162,6 +163,7 @@
+     u2 contended_group() const { return _contended_group; }
+ 
+     bool is_contended() const { return has_annotation(_sun_misc_Contended); }
++    bool is_intrinsic() const { return has_annotation(_org_ObjectLayout_Intrinsic); }
+ 
+     void set_stable(bool stable) { set_annotation(_field_Stable); }
+     bool is_stable() const { return has_annotation(_field_Stable); }
+@@ -242,6 +244,8 @@
+                           int instance_size,
+                           int instance_fields_start,
+                           int instance_fields_end,
++                          int intrinsic_fields_start,
++                          int intrinsic_fields_end,
+                           int static_fields_end);
+ 
+   // Method parsing
+@@ -445,8 +449,8 @@
+                                TRAPS);
+ 
+   // lays out fields in class and returns the total oopmap count
+-  void layout_fields(Handle class_loader, FieldAllocationCount* fac,
+-                     ClassAnnotationCollector* parsed_annotations,
++  void layout_fields(Symbol* class_name, Handle class_loader, Handle protection_domain,
++                     FieldAllocationCount* fac, ClassAnnotationCollector* parsed_annotations,
+                      FieldLayoutInfo* info, TRAPS);
+ 
+  public:
+diff -r 5dc8184af1e2 src/share/vm/classfile/vmSymbols.hpp
+--- a/src/share/vm/classfile/vmSymbols.hpp	Thu Jan 01 16:11:49 2015 -0800
++++ b/src/share/vm/classfile/vmSymbols.hpp	Sun Jan 11 23:58:23 2015 +0100
+@@ -204,6 +204,9 @@
+   template(java_util_concurrent_locks_AbstractOwnableSynchronizer,   "java/util/concurrent/locks/AbstractOwnableSynchronizer") \
+   template(sun_misc_Contended_signature,              "Lsun/misc/Contended;")                     \
+                                                                                                   \
++  /* ObjectLayout support */                                                                      \
++  template(org_ObjectLayout_Intrinsic_signature,      "Lorg/ObjectLayout/Intrinsic;")             \
++                                                                                                  \
+   /* class symbols needed by intrinsics */                                                        \
+   VM_INTRINSICS_DO(VM_INTRINSIC_IGNORE, template, VM_SYMBOL_IGNORE, VM_SYMBOL_IGNORE, VM_ALIAS_IGNORE) \
+                                                                                                   \
+diff -r 5dc8184af1e2 src/share/vm/oops/fieldInfo.hpp
+--- a/src/share/vm/oops/fieldInfo.hpp	Thu Jan 01 16:11:49 2015 -0800
++++ b/src/share/vm/oops/fieldInfo.hpp	Sun Jan 11 23:58:23 2015 +0100
+@@ -248,6 +248,14 @@
+     else   _shorts[access_flags_offset] &= ~JVM_ACC_FIELD_STABLE;
+   }
+ 
++  bool is_intrinsic() const {
++    return (access_flags() & JVM_ACC_FIELD_INTRINSIC) != 0;
++  }
++  void set_intrinsic(bool z) {
++    if (z) _shorts[access_flags_offset] |=  JVM_ACC_FIELD_INTRINSIC;
++    else   _shorts[access_flags_offset] &= ~JVM_ACC_FIELD_INTRINSIC;
++  }
++
+   Symbol* lookup_symbol(int symbol_index) const {
+     assert(is_internal(), "only internal fields");
+     return vmSymbols::symbol_at((vmSymbols::SID)symbol_index);
+diff -r 5dc8184af1e2 src/share/vm/oops/fieldStreams.hpp
+--- a/src/share/vm/oops/fieldStreams.hpp	Thu Jan 01 16:11:49 2015 -0800
++++ b/src/share/vm/oops/fieldStreams.hpp	Sun Jan 11 23:58:23 2015 +0100
+@@ -46,7 +46,9 @@
+   int                 _generic_signature_slot;
+   fieldDescriptor     _fd_buf;
+ 
++ public:
+   FieldInfo* field() const { return FieldInfo::from_field_array(_fields, _index); }
++ protected:
+   InstanceKlass* field_holder() const { return _constants->pool_holder(); }
+ 
+   int init_generic_signature_start_slot() {
+@@ -185,6 +187,10 @@
+     return field()->contended_group();
+   }
+ 
++  bool is_intrinsic() const {
++    return field()->is_intrinsic();
++  }
++
+   // bridge to a heavier API:
+   fieldDescriptor& field_descriptor() const {
+     fieldDescriptor& field = const_cast<fieldDescriptor&>(_fd_buf);
+diff -r 5dc8184af1e2 src/share/vm/runtime/globals.hpp
+--- a/src/share/vm/runtime/globals.hpp	Thu Jan 01 16:11:49 2015 -0800
++++ b/src/share/vm/runtime/globals.hpp	Sun Jan 11 23:58:23 2015 +0100
+@@ -1278,6 +1278,9 @@
+   product(bool, RestrictContended, true,                                    \
+           "Restrict @Contended to trusted classes")                         \
+                                                                             \
++  product(bool, OptimizeObjectLayout, false,                                \
++          "Intrinisfy ObjectLayout implementation")                         \
++                                                                            \
+   product(bool, UseBiasedLocking, true,                                     \
+           "Enable biased locking in JVM")                                   \
+                                                                             \
+diff -r 5dc8184af1e2 src/share/vm/utilities/accessFlags.hpp
+--- a/src/share/vm/utilities/accessFlags.hpp	Thu Jan 01 16:11:49 2015 -0800
++++ b/src/share/vm/utilities/accessFlags.hpp	Sun Jan 11 23:58:23 2015 +0100
+@@ -80,12 +80,14 @@
+   JVM_ACC_FIELD_MODIFICATION_WATCHED = 0x00008000,  // field modification is watched by JVMTI
+   JVM_ACC_FIELD_INTERNAL             = 0x00000400,  // internal field, same as JVM_ACC_ABSTRACT
+   JVM_ACC_FIELD_STABLE               = 0x00000020,  // @Stable field, same as JVM_ACC_SYNCHRONIZED
++  JVM_ACC_FIELD_INTRINSIC            = 0x00000200,  // @org.ObjectLayout.Intrinsic field
+   JVM_ACC_FIELD_HAS_GENERIC_SIGNATURE = 0x00000800, // field has generic signature
+ 
+   JVM_ACC_FIELD_INTERNAL_FLAGS       = JVM_ACC_FIELD_ACCESS_WATCHED |
+                                        JVM_ACC_FIELD_MODIFICATION_WATCHED |
+                                        JVM_ACC_FIELD_INTERNAL |
+                                        JVM_ACC_FIELD_STABLE |
++                                       JVM_ACC_FIELD_INTRINSIC |
+                                        JVM_ACC_FIELD_HAS_GENERIC_SIGNATURE,
+ 
+                                                     // flags accepted by set_field_flags()
+@@ -153,6 +155,7 @@
+   bool on_stack() const                 { return (_flags & JVM_ACC_ON_STACK) != 0; }
+   bool is_internal() const              { return (_flags & JVM_ACC_FIELD_INTERNAL) != 0; }
+   bool is_stable() const                { return (_flags & JVM_ACC_FIELD_STABLE) != 0; }
++  bool is_intrinsic() const             { return (_flags & JVM_ACC_FIELD_INTRINSIC) != 0; }
+   bool field_has_generic_signature() const
+                                         { return (_flags & JVM_ACC_FIELD_HAS_GENERIC_SIGNATURE) != 0; }
+ 

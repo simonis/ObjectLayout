@@ -1,0 +1,4 @@
+ObjectLayout_layout_intrinisic_fields.patch
+ObjectLayout_intrinsify_constructElementWithin.patch
+ObjectLayout_putfield_getfield.patch
+ObjectLayout_C2_putfield_getfield.patch

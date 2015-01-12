@@ -1,0 +1,204 @@
+# HG changeset patch
+# Parent 8fd88f4601f20a49cbc0eae49489076f0a3b6a19
+ObjectLayout: change the interpreter putfield/getfield templates to handle intrinsified objects
+
+diff -r 8fd88f4601f2 src/cpu/x86/vm/templateTable_x86_64.cpp
+--- a/src/cpu/x86/vm/templateTable_x86_64.cpp	Fri Dec 26 10:33:45 2014 +0100
++++ b/src/cpu/x86/vm/templateTable_x86_64.cpp	Sat Dec 27 09:16:29 2014 +0100
+@@ -2286,7 +2286,26 @@
+   const Address field(obj, off, Address::times_1);
+ 
+   Label Done, notByte, notInt, notShort, notChar,
+-              notLong, notFloat, notObj, notDouble;
++              notLong, notFloat, notObj, notDouble, notIntrinsic;
++
++  if (OptimizeObjectLayout) {
++	// 'org.ObjectLayout.Intrinisc' fields are are layed out right within their containing object
++	// so we can don't need to dereference the field (see JVM_ObjectLayoutConstructWithin)
++    __ movl(rdx, flags);
++    __ shrl(rdx, ConstantPoolCacheEntry::is_intrinsic_shift);
++    __ andl(rdx, 0x1);
++    __ testl(rdx, rdx);
++    __ jcc(Assembler::zero, notIntrinsic);
++
++    __ leaq(rax, field);
++    __ push(atos);
++
++    patch_bytecode(Bytecodes::_fast_agetfield_intr, bc, rbx);
++
++    __ jmp(Done);
++
++    __ bind(notIntrinsic);
++  }
+ 
+   __ shrl(flags, ConstantPoolCacheEntry::tos_state_shift);
+   // Make sure we don't need to mask edx after the above shift
+@@ -2486,6 +2505,17 @@
+   //                                              Assembler::StoreStore));
+ 
+   Label notVolatile, Done;
++
++  if (OptimizeObjectLayout) {
++	// 'org.ObjectLayout.Intrinisc' fields are final and they are layed out right within their
++	// containing object so we can not change them with 'putfield' (see JVM_ObjectLayoutConstructWithin)
++    __ movl(rdx, flags);
++    __ shrl(rdx, ConstantPoolCacheEntry::is_intrinsic_shift);
++    __ andl(rdx, 0x1);
++    __ testl(rdx, rdx);
++    __ jcc(Assembler::notZero, notVolatile);  // 'notVolatile' is at the end of 'putfield'
++  }
++
+   __ movl(rdx, flags);
+   __ shrl(rdx, ConstantPoolCacheEntry::is_volatile_shift);
+   __ andl(rdx, 0x1);
+@@ -2768,7 +2798,6 @@
+   __ bind(notVolatile);
+ }
+ 
+-
+ void TemplateTable::fast_accessfield(TosState state) {
+   transition(atos, state);
+ 
+@@ -2821,6 +2850,10 @@
+     __ load_heap_oop(rax, field);
+     __ verify_oop(rax);
+     break;
++  case Bytecodes::_fast_agetfield_intr:
++    __ leaq(rax, field);
++    __ verify_oop(rax);
++    break;
+   case Bytecodes::_fast_lgetfield:
+     __ movq(rax, field);
+     break;
+diff -r 8fd88f4601f2 src/share/vm/interpreter/bytecodes.cpp
+--- a/src/share/vm/interpreter/bytecodes.cpp	Fri Dec 26 10:33:45 2014 +0100
++++ b/src/share/vm/interpreter/bytecodes.cpp	Sat Dec 27 09:16:29 2014 +0100
+@@ -486,6 +486,7 @@
+   //  bytecode               bytecode name           format   wide f.   result tp  stk traps  std code
+ 
+   def(_fast_agetfield      , "fast_agetfield"      , "bJJ"  , NULL    , T_OBJECT ,  0, true , _getfield       );
++  def(_fast_agetfield_intr , "fast_agetfield_intr" , "bJJ"  , NULL    , T_OBJECT ,  0, true , _getfield       );
+   def(_fast_bgetfield      , "fast_bgetfield"      , "bJJ"  , NULL    , T_INT    ,  0, true , _getfield       );
+   def(_fast_cgetfield      , "fast_cgetfield"      , "bJJ"  , NULL    , T_CHAR   ,  0, true , _getfield       );
+   def(_fast_dgetfield      , "fast_dgetfield"      , "bJJ"  , NULL    , T_DOUBLE ,  0, true , _getfield       );
+diff -r 8fd88f4601f2 src/share/vm/interpreter/bytecodes.hpp
+--- a/src/share/vm/interpreter/bytecodes.hpp	Fri Dec 26 10:33:45 2014 +0100
++++ b/src/share/vm/interpreter/bytecodes.hpp	Sat Dec 27 09:16:29 2014 +0100
+@@ -246,6 +246,7 @@
+ 
+     // JVM bytecodes
+     _fast_agetfield       = number_of_java_codes,
++    _fast_agetfield_intr  , // _fast_agetfield for org.ObjectLayout.Intrinisic field
+     _fast_bgetfield       ,
+     _fast_cgetfield       ,
+     _fast_dgetfield       ,
+diff -r 8fd88f4601f2 src/share/vm/interpreter/interpreterRuntime.cpp
+--- a/src/share/vm/interpreter/interpreterRuntime.cpp	Fri Dec 26 10:33:45 2014 +0100
++++ b/src/share/vm/interpreter/interpreterRuntime.cpp	Sat Dec 27 09:16:29 2014 +0100
+@@ -570,6 +570,7 @@
+     state,
+     info.access_flags().is_final(),
+     info.access_flags().is_volatile(),
++    info.access_flags().is_intrinsic(),
+     pool->pool_holder()
+   );
+ IRT_END
+diff -r 8fd88f4601f2 src/share/vm/interpreter/templateTable.cpp
+--- a/src/share/vm/interpreter/templateTable.cpp	Fri Dec 26 10:33:45 2014 +0100
++++ b/src/share/vm/interpreter/templateTable.cpp	Sat Dec 27 09:16:29 2014 +0100
+@@ -479,6 +479,7 @@
+ 
+   // JVM bytecodes
+   def(Bytecodes::_fast_agetfield      , ubcp|____|____|____, atos, atos, fast_accessfield    ,  atos        );
++  def(Bytecodes::_fast_agetfield_intr , ubcp|____|____|____, atos, atos, fast_accessfield    ,  atos        );
+   def(Bytecodes::_fast_bgetfield      , ubcp|____|____|____, atos, itos, fast_accessfield    ,  itos        );
+   def(Bytecodes::_fast_cgetfield      , ubcp|____|____|____, atos, itos, fast_accessfield    ,  itos        );
+   def(Bytecodes::_fast_dgetfield      , ubcp|____|____|____, atos, dtos, fast_accessfield    ,  dtos        );
+diff -r 8fd88f4601f2 src/share/vm/oops/cpCache.cpp
+--- a/src/share/vm/oops/cpCache.cpp	Fri Dec 26 10:33:45 2014 +0100
++++ b/src/share/vm/oops/cpCache.cpp	Sat Dec 27 09:16:29 2014 +0100
+@@ -112,14 +112,16 @@
+                                        TosState field_type,
+                                        bool is_final,
+                                        bool is_volatile,
++                                       bool is_intrinsic,
+                                        Klass* root_klass) {
+   set_f1(field_holder());
+   set_f2(field_offset);
+   assert((field_index & field_index_mask) == field_index,
+          "field index does not fit in low flag bits");
+   set_field_flags(field_type,
+-                  ((is_volatile ? 1 : 0) << is_volatile_shift) |
+-                  ((is_final    ? 1 : 0) << is_final_shift),
++                  ((is_volatile  ? 1 : 0) << is_volatile_shift) |
++                  ((is_final     ? 1 : 0) << is_final_shift) |
++                  ((is_intrinsic ? 1 : 0) << is_intrinsic_shift),
+                   field_index);
+   set_bytecode_1(get_code);
+   set_bytecode_2(put_code);
+diff -r 8fd88f4601f2 src/share/vm/oops/cpCache.hpp
+--- a/src/share/vm/oops/cpCache.hpp	Fri Dec 26 10:33:45 2014 +0100
++++ b/src/share/vm/oops/cpCache.hpp	Sat Dec 27 09:16:29 2014 +0100
+@@ -47,10 +47,10 @@
+ // _indices   [ b2 | b1 |  index  ]  index = constant_pool_index
+ // _f1        [  entry specific   ]  metadata ptr (method or klass)
+ // _f2        [  entry specific   ]  vtable or res_ref index, or vfinal method ptr
+-// _flags     [tos|0|F=1|0|0|0|f|v|0 |0000|field_index] (for field entries)
+-// bit length [ 4 |1| 1 |1|1|1|1|1|1 |-4--|----16-----]
+-// _flags     [tos|0|F=0|M|A|I|f|0|vf|0000|00000|psize] (for method entries)
+-// bit length [ 4 |1| 1 |1|1|1|1|1|1 |-4--|--8--|--8--]
++// _flags     [tos|0|F=1|0|0|0|f|v|0 |i|0000|field_index] (for field entries)
++// bit length [ 4 |1| 1 |1|1|1|1|1|1 |1|-4--|----16-----]
++// _flags     [tos|0|F=0|M|A|I|f|0|vf|0|0000|00000|psize] (for method entries)
++// bit length [ 4 |1| 1 |1|1|1|1|1|1 |1|-4--|--8--|--8--]
+ 
+ // --------------------------------
+ //
+@@ -187,6 +187,7 @@
+     is_final_shift             = 22,  // (f) is the field or method final?
+     is_volatile_shift          = 21,  // (v) is the field volatile?
+     is_vfinal_shift            = 20,  // (vf) did the call resolve to a final method?
++    is_intrinsic_shift         = 19,  // (i) is the field 'org.ObjectLayout.intrinisc'?
+     // low order bits give field index (for FieldInfo) or method parameter size:
+     field_index_bits           = 16,
+     field_index_mask           = right_n_bits(field_index_bits),
+@@ -220,8 +221,9 @@
+     int             orig_field_index,            // the original field index in the field holder
+     int             field_offset,                // the field offset in words in the field holder
+     TosState        field_type,                  // the (machine) field type
+-    bool            is_final,                     // the field is final
++    bool            is_final,                    // the field is final
+     bool            is_volatile,                 // the field is volatile
++    bool            is_intrinsic,                // the field is 'org.ObjectLayout.intrinsic'
+     Klass*          root_klass                   // needed by the GC to dirty the klass
+   );
+ 
+@@ -346,6 +348,7 @@
+   int  parameter_size() const                    { assert(is_method_entry(), ""); return (_flags & parameter_size_mask); }
+   bool is_volatile() const                       { return (_flags & (1 << is_volatile_shift))       != 0; }
+   bool is_final() const                          { return (_flags & (1 << is_final_shift))          != 0; }
++  bool is_intrinsic() const                      { return (_flags & (1 << is_intrinsic_shift))      != 0; }
+   bool is_forced_virtual() const                 { return (_flags & (1 << is_forced_virtual_shift)) != 0; }
+   bool is_vfinal() const                         { return (_flags & (1 << is_vfinal_shift))         != 0; }
+   bool has_appendix() const                      { return (!is_f1_null()) && (_flags & (1 << has_appendix_shift))      != 0; }
+diff -r 8fd88f4601f2 src/share/vm/utilities/accessFlags.cpp
+--- a/src/share/vm/utilities/accessFlags.cpp	Fri Dec 26 10:33:45 2014 +0100
++++ b/src/share/vm/utilities/accessFlags.cpp	Sat Dec 27 09:16:29 2014 +0100
+@@ -59,7 +59,16 @@
+   if (is_volatile    ()) st->print("volatile "    );
+   if (is_transient   ()) st->print("transient "   );
+   if (is_native      ()) st->print("native "      );
+-  if (is_interface   ()) st->print("interface "   );
++  if (is_interface   ()) {
++    // JVM_ACC_FIELD_INTRINSIC and JVM_ACC_INTERFACE share the same value, but
++    // JVM_ACC_FIELD_INTRINSIC can only be used on final fields whereas interfaces can never be final.
++    if (is_final()) {
++      st->print("{intrinsic} ");
++    }
++    else {
++      st->print("interface ");
++    }
++  }
+   if (is_abstract    ()) st->print("abstract "    );
+   if (is_strict      ()) st->print("strict "      );
+   if (is_synthetic   ()) st->print("synthetic "   );
