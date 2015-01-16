@@ -45,6 +45,10 @@ abstract class AbstractIntrinsicObjectModel<T>  {
         return objectClass;
     }
 
+    Field getField() {
+        return field;
+    }
+
     private void sanityCheckAtModelConstruction() {
         if ((primitiveArrayModel != null) &&
                 !primitiveArrayModel._getArrayClass().equals(objectClass)) {

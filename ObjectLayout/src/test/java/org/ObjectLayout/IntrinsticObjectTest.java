@@ -252,6 +252,34 @@ public class IntrinsticObjectTest {
         bad.getPoint().getX();
     }
 
+    static class RecursiveIntrinsicFieldType {
+        int x ,y;
+        @Intrinsic
+        private final RecursiveIntrinsicFieldType rec = IntrinsicObjects.constructWithin("rec", this);
+    }
+
+    @Test(expected = ClassCircularityError.class)
+    public void testRecursiveIntrinsicFieldType() {
+        RecursiveIntrinsicFieldType bad = new RecursiveIntrinsicFieldType();
+    }
+
+    static class MutuallyRecursiveIntrinsicFieldTypeA {
+        int x, y;
+        @Intrinsic
+        private final MutuallyRecursiveIntrinsicFieldTypeB rec = IntrinsicObjects.constructWithin("rec", this);
+    }
+
+    static class MutuallyRecursiveIntrinsicFieldTypeB {
+        int x, y;
+        @Intrinsic
+        private final MutuallyRecursiveIntrinsicFieldTypeA rec = IntrinsicObjects.constructWithin("rec", this);
+    }
+
+    @Test(expected = ClassCircularityError.class)
+    public void testMutuallyRecursiveIntrinsicFieldType() {
+        MutuallyRecursiveIntrinsicFieldTypeA bad = new MutuallyRecursiveIntrinsicFieldTypeA();
+    }
+
     /**
      * A simple x,y point class to be used as an element in various other examples.
      *

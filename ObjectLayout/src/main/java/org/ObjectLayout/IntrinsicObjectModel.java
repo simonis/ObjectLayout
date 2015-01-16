@@ -8,6 +8,8 @@ package org.ObjectLayout;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * An {@link IntrinsicObjectModel} models the information needed to make a specific instance field of a
@@ -168,10 +170,42 @@ final class IntrinsicObjectModel<T> extends AbstractIntrinsicObjectModel<T> {
         return instantiate(containingObject, arrayBuilder);
     }
 
+    static final ThreadLocal<Set<IntrinsicObjectModel<?>>> modelSet =
+            new ThreadLocal<Set<IntrinsicObjectModel<?>>> () {
+                @Override
+                protected Set<IntrinsicObjectModel<?>> initialValue() {
+                    return new HashSet<IntrinsicObjectModel<?>>();
+                }
+    };
+
+    private void circularityCheckEnter() {
+        if (modelSet.get().contains(this)) {
+            modelSet.get().clear();
+            throw new ClassCircularityError("Recursively intrinsifying the field: " + this.getField());
+        }
+        else {
+            modelSet.get().add(this);
+        }
+    }
+
+    private void circularityCheckExit() {
+        modelSet.get().remove(this);
+    }
+
+    private void handleCircularityError(InvocationTargetException ex) {
+        if (ex.getCause() != null && ex.getCause() instanceof ClassCircularityError) {
+            throw (ClassCircularityError)ex.getCause();
+        } else {
+            throw new RuntimeException(ex);
+        }
+    }
+
     private <E> T instantiate(
             final Object containingObject,
             final Constructor<T> objectConstructor,
             final Object... args) {
+
+        circularityCheckEnter();
         try {
             _sanityCheckInstantiation(containingObject);
             T intrinsicInstance;
@@ -199,13 +233,19 @@ final class IntrinsicObjectModel<T> extends AbstractIntrinsicObjectModel<T> {
         } catch (IllegalAccessException ex) {
             throw new RuntimeException(ex);
         } catch (InvocationTargetException ex) {
+            handleCircularityError(ex);
+            // THe following throw will never be executed because handleCircularityError() either throws
+            // a RuntimeException or a ClassCircualrityError. We just need it to calm down the compiler.
             throw new RuntimeException(ex);
+        } finally {
+            circularityCheckExit();
         }
     }
 
     private <E> T instantiate(
             final Object containingObject,
             final StructuredArrayBuilder arrayBuilder) {
+        circularityCheckEnter();
         try {
             _sanityCheckInstantiation(containingObject);
             @SuppressWarnings("unchecked")
@@ -222,14 +262,19 @@ final class IntrinsicObjectModel<T> extends AbstractIntrinsicObjectModel<T> {
         } catch (IllegalAccessException ex) {
             throw new RuntimeException(ex);
         } catch (InvocationTargetException ex) {
+            handleCircularityError(ex);
+            // THe following throw will never be executed because handleCircularityError() either throws
+            // a RuntimeException or a ClassCircualrityError. We just need it to calm down the compiler.
             throw new RuntimeException(ex);
+        } finally {
+            circularityCheckExit();
         }
     }
-
 
     private T instantiate(
             final Object containingObject,
             final PrimitiveArrayBuilder arrayBuilder) {
+        circularityCheckEnter();
         try {
             _sanityCheckInstantiation(containingObject);
             @SuppressWarnings("unchecked")
@@ -245,7 +290,12 @@ final class IntrinsicObjectModel<T> extends AbstractIntrinsicObjectModel<T> {
         } catch (IllegalAccessException ex) {
             throw new RuntimeException(ex);
         } catch (InvocationTargetException ex) {
+            handleCircularityError(ex);
+            // THe following throw will never be executed because handleCircularityError() either throws
+            // a RuntimeException or a ClassCircualrityError. We just need it to calm down the compiler.
             throw new RuntimeException(ex);
+        } finally {
+            circularityCheckExit();
         }
     }
 }
