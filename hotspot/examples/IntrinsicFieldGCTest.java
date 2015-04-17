@@ -3,12 +3,12 @@
  * as explained at http://creativecommons.org/publicdomain/zero/1.0/
  *
  *
- * Basic test for @Intrinsic fields laied out within their containing objects.
+ * Basic GC test for @Intrinsic fields laied out within their containing objects.
  *
 
 from <ObjectLayout>/hotspot do:
 
-javac -cp ../ObjectLayout/target/classes examples/IntrinsicFieldTest.java
+javac -cp ../ObjectLayout/target/classes examples/IntrinsicFieldGCTest.java
 
 java -cp ../ObjectLayout/target/classes:examples \
      -XX:-DoEscapeAnalysis -XX:-TieredCompilation \

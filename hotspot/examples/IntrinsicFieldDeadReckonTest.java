@@ -103,8 +103,8 @@ java -cp ../ObjectLayout/target/classes:examples \
  * movl    R11, [RSI + #12 (8-bit)]	! Field: IntrinsicFieldDeadReckonTest$Triangle.l
  * movl    R10, [R11 + #12 (8-bit)]	! Field: IntrinsicFieldDeadReckonTest$Line.p1
  * NullCheck R11
- * addl    [R11 + #12 (8-bit)], RDX	! Field: IntrinsicFieldDeadReckonTest$Point.x
- * NullCheck R11
+ * addl    [R10 + #12 (8-bit)], RDX	! Field: IntrinsicFieldDeadReckonTest$Point.x
+ * NullCheck R10
  *
  * to:
  *
